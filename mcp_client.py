@@ -10,7 +10,6 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 load_dotenv(override=True)
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 AVIATION_STACK_API_KEY = os.getenv("AVIATION_STACK_API_KEY")
-
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
 # Absolute path to this project's root, so server paths below work no matter
@@ -372,7 +371,7 @@ def get_llm():
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+        return ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"))
 
     if provider == "deepseek":
         from langchain_deepseek import ChatDeepSeek

@@ -2,6 +2,7 @@ import os
 import sys
 import uuid
 import tempfile
+import traceback
 
 import gradio as gr
 from langchain_core.messages import HumanMessage
@@ -63,19 +64,22 @@ CUSTOM_CSS = """
     border: 1px solid var(--border-color-primary);
 }
 
-.result-box textarea {
-    font-size: 0.95rem !important;
-    line-height: 1.6 !important;
+.result-box {
+    font-size: 0.95rem;
+    line-height: 1.6;
 }
 
-.result-card {
-    border-radius: 14px;
-    border: 1px solid var(--border-color-primary);
-    padding: 4px;
+.error-card {
+    border-radius: 12px;
+    border: 1px solid color-mix(in srgb, #dc2626 40%, var(--border-color-primary));
+    background: color-mix(in srgb, #dc2626 12%, var(--background-fill-primary));
+    padding: 12px 16px;
+    margin-bottom: 12px;
 }
 
-footer {
-    display: none !important;
+@keyframes pulse { 50% { opacity: .35; } }
+#status-badge .dot-running {
+    animation: pulse 1.2s ease-in-out infinite;
 }
 """
 
@@ -101,6 +105,12 @@ STATUS_RUNNING = "Planning your trip..."
 STATUS_DONE = "Itinerary ready"
 STATUS_ERROR = "Something went wrong"
 
+# Stage-specific placeholder shown in each panel until its agent finishes.
+WAITING_FLIGHTS = "Searching flights..."
+WAITING_HOTELS = "Finding hotels..."
+WAITING_WEATHER = "Checking the weather..."
+WAITING_ITINERARY = "Waiting for all agents to finish before writing your itinerary..."
+
 
 # Renders the small colored-dot status pill shown above the results tabs.
 # Returned as raw HTML since Gradio's gr.HTML component just injects it as-is.
@@ -112,9 +122,10 @@ def _badge(text: str, kind: str = "idle") -> str:
         "error": "#dc2626",
     }
     color = colors.get(kind, "#64748b")
+    dot_class = "dot dot-running" if kind == "running" else "dot"
     return (
-        f'<div id="status-badge">'
-        f'<span style="width:8px;height:8px;border-radius:50%;background:{color};display:inline-block;"></span>'
+        f'<div id="status-badge" role="status" aria-live="polite">'
+        f'<span class="{dot_class}" style="width:8px;height:8px;border-radius:50%;background:{color};display:inline-block;"></span>'
         f'<span>{text}</span>'
         f'</div>'
     )
@@ -170,8 +181,10 @@ def plan_trip(query, trip_length, budget, style, travelers):
     query = (query or "").strip()
 
     if not query:
+        gr.Warning("Please describe your trip first.")
         yield (
             "", "", "", "",
+            gr.update(visible=False),
             gr.update(visible=False),
             _badge(STATUS_IDLE, "idle"),
             gr.update(visible=False),
@@ -182,10 +195,16 @@ def plan_trip(query, trip_length, budget, style, travelers):
 
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
-    waiting = "Working on it..."
+    # Initialized before the try block so the except path can still yield the
+    # current panel values even if stream() raises before its first iteration.
+    flight = WAITING_FLIGHTS
+    hotel = WAITING_HOTELS
+    weather = WAITING_WEATHER
+    itinerary = WAITING_ITINERARY
 
     yield (
-        waiting, waiting, waiting, waiting,
+        flight, hotel, weather, itinerary,
+        gr.update(visible=False),
         gr.update(visible=True),
         _badge(STATUS_RUNNING, "running"),
         gr.update(visible=False),
@@ -208,20 +227,23 @@ def plan_trip(query, trip_length, budget, style, travelers):
             config=config,
             stream_mode="values",
         ):
-            flight = state.get("flight_results") or waiting
-            hotel = state.get("hotel_results") or waiting
-            weather = state.get("weather_results") or waiting
-            itinerary = state.get("itinerary") or waiting
+            flight = state.get("flight_results") or WAITING_FLIGHTS
+            hotel = state.get("hotel_results") or WAITING_HOTELS
+            weather = state.get("weather_results") or WAITING_WEATHER
+            itinerary = state.get("itinerary") or WAITING_ITINERARY
+
+            done = sum(bool(state.get(k)) for k in ("flight_results", "hotel_results", "weather_results", "itinerary"))
 
             yield (
                 flight, hotel, weather, itinerary,
+                gr.update(visible=False),
                 gr.update(visible=True),
-                _badge(STATUS_RUNNING, "running"),
+                _badge(f"Planning your trip... ({done}/4 agents done)", "running"),
                 gr.update(visible=False),
             )
 
         download_update = gr.update(visible=False)
-        if itinerary and itinerary != waiting:
+        if itinerary and itinerary != WAITING_ITINERARY:
             base = os.path.join(tempfile.gettempdir(), f"itinerary_{uuid.uuid4().hex}")
             txt_path = f"{base}.txt"
             pdf_path = f"{base}.pdf"
@@ -234,15 +256,29 @@ def plan_trip(query, trip_length, budget, style, travelers):
 
         yield (
             flight, hotel, weather, itinerary,
+            gr.update(visible=False),
             gr.update(visible=True),
             _badge(STATUS_DONE, "done"),
             download_update,
         )
 
     except Exception as exc:
-        error_text = f"Trip planning failed: {exc}"
+        # Full traceback goes to the terminal; the UI banner only gets the
+        # short exception message.
+        traceback.print_exc()
+
+        # Keep whatever partial results already streamed in; panels whose
+        # agent never ran drop their "Searching..." placeholder so they don't
+        # look stuck alongside the error banner.
+        unavailable = "*Not available — planning stopped early.*"
+        flight = unavailable if flight == WAITING_FLIGHTS else flight
+        hotel = unavailable if hotel == WAITING_HOTELS else hotel
+        weather = unavailable if weather == WAITING_WEATHER else weather
+        itinerary = unavailable if itinerary == WAITING_ITINERARY else itinerary
+
         yield (
-            error_text, error_text, error_text, error_text,
+            flight, hotel, weather, itinerary,
+            gr.update(value=f"**Trip planning failed:** {exc}", visible=True),
             gr.update(visible=True),
             _badge(STATUS_ERROR, "error"),
             gr.update(visible=False),
@@ -253,6 +289,7 @@ def clear_all():
     return (
         "", TRIP_LENGTHS[1], BUDGET_LEVELS[1], TRAVEL_STYLES[0], 2,
         "", "", "", "",
+        gr.update(visible=False),
         gr.update(visible=False),
         _badge(STATUS_IDLE, "idle"),
         gr.update(visible=False),
@@ -278,8 +315,8 @@ with gr.Blocks(title="AI Trip Planner") as demo:
             travelers = gr.Slider(1, 10, value=2, step=1, label="Travelers")
 
         with gr.Row():
-            clear_btn = gr.Button("Clear")
-            submit_btn = gr.Button("Plan my trip", variant="primary")
+            clear_btn = gr.Button("Clear", variant="secondary", scale=1)
+            submit_btn = gr.Button("Plan my trip", variant="primary", scale=3)
 
     gr.Examples(
         examples=EXAMPLES,
@@ -290,35 +327,34 @@ with gr.Blocks(title="AI Trip Planner") as demo:
     status_html = gr.HTML(_badge(STATUS_IDLE, "idle"))
 
     with gr.Column(visible=False) as results_col:
+        error_md = gr.Markdown(visible=False, elem_classes="error-card")
+
+        # Tabs follow pipeline order so the default-open tab fills in first.
         with gr.Tabs():
-            with gr.Tab("Itinerary"):
-                with gr.Column(elem_classes="result-card"):
-                    itinerary_out = gr.Textbox(
-                        label="", lines=18, interactive=False, buttons=["copy"],
-                        elem_classes="result-box",
-                    )
             with gr.Tab("Flights"):
-                with gr.Column(elem_classes="result-card"):
-                    flight_out = gr.Textbox(
-                        label="", lines=18, interactive=False, buttons=["copy"],
-                        elem_classes="result-box",
-                    )
+                flight_out = gr.Markdown(
+                    show_label=False, container=True, max_height=480,
+                    buttons=["copy"], line_breaks=True, elem_classes="result-box",
+                )
             with gr.Tab("Hotels"):
-                with gr.Column(elem_classes="result-card"):
-                    hotel_out = gr.Textbox(
-                        label="", lines=18, interactive=False, buttons=["copy"],
-                        elem_classes="result-box",
-                    )
+                hotel_out = gr.Markdown(
+                    show_label=False, container=True, max_height=480,
+                    buttons=["copy"], line_breaks=True, elem_classes="result-box",
+                )
             with gr.Tab("Weather"):
-                with gr.Column(elem_classes="result-card"):
-                    weather_out = gr.Textbox(
-                        label="", lines=18, interactive=False, buttons=["copy"],
-                        elem_classes="result-box",
-                    )
+                weather_out = gr.Markdown(
+                    show_label=False, container=True, max_height=480,
+                    buttons=["copy"], line_breaks=True, elem_classes="result-box",
+                )
+            with gr.Tab("Itinerary"):
+                itinerary_out = gr.Markdown(
+                    show_label=False, container=True, max_height=480,
+                    buttons=["copy"], line_breaks=True, elem_classes="result-box",
+                )
 
         download_file = gr.File(label="Download itinerary (TXT & PDF)", file_count="multiple", visible=False)
 
-    outputs = [flight_out, hotel_out, weather_out, itinerary_out, results_col, status_html, download_file]
+    outputs = [flight_out, hotel_out, weather_out, itinerary_out, error_md, results_col, status_html, download_file]
     inputs = [query_box, trip_length, budget, style, travelers]
 
     submit_btn.click(fn=plan_trip, inputs=inputs, outputs=outputs, api_name="plan_trip")
@@ -329,9 +365,9 @@ with gr.Blocks(title="AI Trip Planner") as demo:
         inputs=None,
         outputs=[query_box, trip_length, budget, style, travelers,
                  flight_out, hotel_out, weather_out, itinerary_out,
-                 results_col, status_html, download_file],
+                 error_md, results_col, status_html, download_file],
     )
 
 
 if __name__ == "__main__":
-    demo.launch(theme=THEME, css=CUSTOM_CSS)
+    demo.launch(theme=THEME, css=CUSTOM_CSS, footer_links=[])
