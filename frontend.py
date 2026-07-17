@@ -53,6 +53,7 @@ CUSTOM_CSS = """
 }
 
 #status-badge {
+    margin: 18px 0 6px;
     display: inline-flex;
     align-items: center;
     gap: 8px;
